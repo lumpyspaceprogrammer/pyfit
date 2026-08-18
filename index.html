@@ -350,6 +350,7 @@
       isLoggedIn: false,
       userEmail: "",
       demoMode: false,
+      generatedPattern: null,
       gallery: [
         { id: 1, title: "Y2K Asymmetrical Corset", creator: "@skate_sews", price: 2.99, image: "https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?w=500", buys: 14 },
         { id: 2, title: "Cyber Punk Patchwork Top", creator: "@neo_threads", price: 2.99, image: "https://images.unsplash.com/photo-1539109136881-3be0616acf4b?w=500", buys: 9 },
@@ -357,6 +358,20 @@
       ],
       meshParams: { flare: 0.35, waistRadius: 0.65, topHeight: 1.8 }
     };
+
+    const API_BASE = window.location.origin.startsWith('http')
+      ? window.location.origin
+      : 'http://localhost:8000';
+
+    async function postJSON(path, payload) {
+      const response = await fetch(`${API_BASE}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) throw new Error(`Request failed: ${response.status}`);
+      return response.json();
+    }
 
     function updateCreditUI() {
       document.getElementById('credit-count-badge').innerText = `${appState.credits} Credit${appState.credits === 1 ? '' : 's'}`;
@@ -512,20 +527,28 @@
       scene.add(garmentMesh);
     }
 
-    document.getElementById('btn-refine').addEventListener('click', () => {
+    document.getElementById('btn-refine').addEventListener('click', async () => {
       const loader = document.getElementById('threed-loader');
       loader.classList.remove('hidden');
-      setTimeout(() => {
+      try {
+        const refinementText = document.getElementById('refinement-input').value;
+        const data = await postJSON('/api/mesh/refine', {
+          refinementText,
+          meshParams: appState.meshParams
+        });
+        if (data.meshParams) appState.meshParams = data.meshParams;
+      } catch {
         appState.meshParams.flare += 0.3;
+      } finally {
         buildGarment3DMesh();
         loader.classList.add('hidden');
-      }, 700);
+      }
     });
 
     document.getElementById('btn-to-step3').addEventListener('click', () => showStep(3));
 
     // STEP 3 & 4 (DRAFTING MATH & PDF)
-    document.getElementById('measurements-form').addEventListener('submit', (e) => {
+    document.getElementById('measurements-form').addEventListener('submit', async (e) => {
       e.preventDefault();
 
       // Deduct 1 credit upon calculation if not demo mode
@@ -543,13 +566,24 @@
         length: parseFloat(document.getElementById('m-length').value)
       };
 
-      document.getElementById('instructions-container').innerHTML = `
-        <ol class="list-decimal list-inside space-y-2">
-          <li class="bg-indigo-50 p-2.5 b-brutal rounded-xl"><b>Print Check:</b> Ensure 100% actual print size. Measure the 50mm square on Page A1.</li>
-          <li class="bg-indigo-50 p-2.5 b-brutal rounded-xl"><b>Assembly:</b> Align crosshairs (A1 -> A2, B1 -> B2) and tape pages.</li>
-          <li class="bg-indigo-50 p-2.5 b-brutal rounded-xl"><b>Cutting:</b> Pre-included seam allowance = 1.5cm. Cut fabric along grainlines.</li>
-        </ol>
-      `;
+      try {
+        const prompt = document.getElementById('prompt-input').value;
+        const payload = { designPrompt: prompt, measurements: stateMeasurements };
+        appState.generatedPattern = await postJSON('/api/pattern/generate', payload);
+      } catch {
+        appState.generatedPattern = null;
+      }
+
+      const instructionList = (appState.generatedPattern?.instructions?.length
+        ? appState.generatedPattern.instructions
+        : [
+            "Print Check: Ensure 100% actual print size. Measure the 50mm square on Page A1.",
+            "Assembly: Align crosshairs (A1 -> A2, B1 -> B2) and tape pages.",
+            "Cutting: Pre-included seam allowance = 1.5cm. Cut fabric along grainlines."
+          ])
+        .map(item => `<li class="bg-indigo-50 p-2.5 b-brutal rounded-xl">${item}</li>`)
+        .join('');
+      document.getElementById('instructions-container').innerHTML = `<ol class="list-decimal list-inside space-y-2">${instructionList}</ol>`;
 
       showStep(4);
     });
@@ -608,13 +642,33 @@
       doc.setFontSize(8);
       doc.text("50mm x 50mm SCALE CHECK", 17, 45);
 
-      // Draw Pattern Geometry Example
+      const pieces = appState.generatedPattern?.pattern?.pieces || [];
       doc.setLineWidth(0.8);
       doc.setDrawColor(217, 70, 239);
-      doc.line(30, 100, 150, 90);
-      doc.line(150, 90, 170, 220);
-      doc.line(170, 220, 30, 220);
-      doc.line(30, 220, 30, 100);
+
+      if (pieces.length) {
+        let xOffset = 20;
+        const yOffset = 100;
+        const scale = 2.0;
+        pieces.forEach(piece => {
+          const points = piece.points || [];
+          if (points.length > 1) {
+            for (let i = 0; i < points.length; i += 1) {
+              const [x1, y1] = points[i];
+              const [x2, y2] = points[(i + 1) % points.length];
+              doc.line(xOffset + x1 * scale, yOffset + y1 * scale, xOffset + x2 * scale, yOffset + y2 * scale);
+            }
+            doc.setFontSize(9);
+            doc.text(piece.name || "Pattern Piece", xOffset, yOffset - 4);
+            xOffset += 58;
+          }
+        });
+      } else {
+        doc.line(30, 100, 150, 90);
+        doc.line(150, 90, 170, 220);
+        doc.line(170, 220, 30, 220);
+        doc.line(30, 220, 30, 100);
+      }
 
       doc.save("PrintYourFit_CustomPattern.pdf");
     });
