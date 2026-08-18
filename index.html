@@ -337,7 +337,12 @@
       <button onclick="closeAuthModal()" class="absolute top-4 right-4 bg-red-400 b-brutal p-1 rounded-lg font-black">✕</button>
       <h3 class="font-black text-xl uppercase text-black y2k-font">Sign In / Sign Up</h3>
       <input type="email" id="auth-email" placeholder="Enter your email..." class="w-full bg-indigo-50 b-brutal rounded-xl p-3 text-sm font-bold outline-none">
-      <button onclick="submitAuth()" class="w-full py-3 bg-fuchsia-300 hover:bg-fuchsia-400 b-brutal rounded-xl font-black text-black uppercase shadow-brutal">Continue</button>
+      <input type="password" id="auth-password" placeholder="Password (8+ chars)" class="w-full bg-indigo-50 b-brutal rounded-xl p-3 text-sm font-bold outline-none">
+      <div class="grid grid-cols-2 gap-2">
+        <button onclick="submitAuth('login')" class="w-full py-3 bg-fuchsia-300 hover:bg-fuchsia-400 b-brutal rounded-xl font-black text-black uppercase shadow-brutal">Login</button>
+        <button onclick="submitAuth('signup')" class="w-full py-3 bg-cyan-300 hover:bg-cyan-400 b-brutal rounded-xl font-black text-black uppercase shadow-brutal">Sign Up</button>
+      </div>
+      <p id="auth-message" class="text-xs font-bold text-slate-600"></p>
     </div>
   </div>
 
@@ -349,6 +354,7 @@
       credits: 1, // 1st Pattern Free
       isLoggedIn: false,
       userEmail: "",
+      authToken: "",
       demoMode: false,
       generatedPattern: null,
       gallery: [
@@ -363,18 +369,68 @@
       ? window.location.origin
       : 'http://localhost:8000';
 
-    async function postJSON(path, payload) {
+    function authHeaders() {
+      return appState.authToken ? { Authorization: 'Bearer ' + appState.authToken } : {};
+    }
+
+    async function postJSON(path, payload, includeAuth = false) {
       const response = await fetch(`${API_BASE}${path}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...(includeAuth ? authHeaders() : {}) },
         body: JSON.stringify(payload)
       });
-      if (!response.ok) throw new Error(`Request failed: ${response.status}`);
+      if (!response.ok) {
+        const errorBody = await response.json().catch(() => ({}));
+        throw new Error(errorBody.error || `Request failed: ${response.status}`);
+      }
       return response.json();
+    }
+
+    async function getJSON(path, includeAuth = false) {
+      const response = await fetch(`${API_BASE}${path}`, {
+        method: 'GET',
+        headers: includeAuth ? authHeaders() : {}
+      });
+      if (!response.ok) {
+        const errorBody = await response.json().catch(() => ({}));
+        throw new Error(errorBody.error || `Request failed: ${response.status}`);
+      }
+      return response.json();
+    }
+
+    function setAuthMessage(message, isError = false) {
+      const el = document.getElementById('auth-message');
+      el.innerText = message || '';
+      el.className = `text-xs font-bold ${isError ? 'text-red-600' : 'text-slate-600'}`;
+    }
+
+    function setAuthState(token, user) {
+      appState.authToken = token || '';
+      appState.isLoggedIn = Boolean(token && user);
+      appState.userEmail = user?.email || '';
+      if (typeof user?.credits === 'number') appState.credits = user.credits;
+      localStorage.setItem('pyfit_auth_token', appState.authToken || '');
+      document.getElementById('user-status-text').innerText = appState.isLoggedIn ? appState.userEmail.split('@')[0] : 'Sign In';
+      updateCreditUI();
     }
 
     function updateCreditUI() {
       document.getElementById('credit-count-badge').innerText = `${appState.credits} Credit${appState.credits === 1 ? '' : 's'}`;
+    }
+
+    async function hydrateSession() {
+      const storedToken = localStorage.getItem('pyfit_auth_token') || '';
+      if (!storedToken) {
+        setAuthState('', null);
+        return;
+      }
+      appState.authToken = storedToken;
+      try {
+        const data = await getJSON('/api/auth/me', true);
+        setAuthState(storedToken, data.user);
+      } catch {
+        setAuthState('', null);
+      }
     }
 
     function showTab(tab) {
@@ -395,29 +451,60 @@
     // Modal Control
     function openPricingModal() { document.getElementById('modal-pricing').classList.remove('hidden'); }
     function closePricingModal() { document.getElementById('modal-pricing').classList.add('hidden'); }
-    function openAuthModal() { document.getElementById('modal-auth').classList.remove('hidden'); }
+    function openAuthModal() {
+      if (appState.isLoggedIn) {
+        const shouldLogout = confirm('Sign out of your account?');
+        if (shouldLogout) submitLogout();
+        return;
+      }
+      setAuthMessage('');
+      document.getElementById('modal-auth').classList.remove('hidden');
+    }
     function closeAuthModal() { document.getElementById('modal-auth').classList.add('hidden'); }
 
-    function submitAuth() {
-      const email = document.getElementById('auth-email').value;
-      if (email) {
-        appState.isLoggedIn = true;
-        appState.userEmail = email;
-        document.getElementById('user-status-text').innerText = email.split('@')[0];
+    async function submitAuth(mode) {
+      const email = document.getElementById('auth-email').value.trim().toLowerCase();
+      const password = document.getElementById('auth-password').value;
+      if (!email || password.length < 8) {
+        setAuthMessage('Enter a valid email and password (8+ chars).', true);
+        return;
+      }
+      try {
+        const data = await postJSON(`/api/auth/${mode}`, { email, password });
+        setAuthState(data.token, data.user);
+        setAuthMessage(mode === 'signup' ? 'Account created!' : 'Signed in!');
         closeAuthModal();
+      } catch (error) {
+        setAuthMessage(error.message, true);
       }
     }
 
-    function subscribeTier(tierName, creditsToAdd) {
+    async function submitLogout() {
+      try {
+        await postJSON('/api/auth/logout', {}, true);
+      } catch {}
+      setAuthState('', null);
+    }
+
+    async function subscribeTier(tierName, creditsToAdd) {
       if (!appState.isLoggedIn) {
         closePricingModal();
         openAuthModal();
         return;
       }
-      appState.credits += creditsToAdd;
-      updateCreditUI();
-      closePricingModal();
-      alert(`✦ Subscribed to ${tierName}! Added ${creditsToAdd} outfit credits.`);
+      const amountMap = { 'Tier 1': 999, 'Tier 2': 2499, 'Tier 3': 3999 };
+      try {
+        const result = await postJSON('/api/payments/checkout', {
+          tierName,
+          credits: creditsToAdd,
+          amountCents: amountMap[tierName] || 999,
+          origin: window.location.origin
+        }, true);
+        closePricingModal();
+        window.location.href = result.checkoutUrl;
+      } catch (error) {
+        alert(`Checkout unavailable: ${error.message}`);
+      }
     }
 
     // INVESTOR / YC DEMO MODE TRIGGER
@@ -551,12 +638,6 @@
     document.getElementById('measurements-form').addEventListener('submit', async (e) => {
       e.preventDefault();
 
-      // Deduct 1 credit upon calculation if not demo mode
-      if (!appState.demoMode) {
-        appState.credits = Math.max(0, appState.credits - 1);
-        updateCreditUI();
-      }
-
       stateMeasurements = {
         bust: parseFloat(document.getElementById('m-bust').value),
         waist: parseFloat(document.getElementById('m-waist').value),
@@ -568,9 +649,25 @@
 
       try {
         const prompt = document.getElementById('prompt-input').value;
-        const payload = { designPrompt: prompt, measurements: stateMeasurements };
-        appState.generatedPattern = await postJSON('/api/pattern/generate', payload);
-      } catch {
+        const payload = {
+          designPrompt: prompt,
+          measurements: stateMeasurements,
+          consumeCredit: appState.isLoggedIn && !appState.demoMode
+        };
+        appState.generatedPattern = await postJSON('/api/pattern/generate', payload, appState.isLoggedIn);
+        if (typeof appState.generatedPattern?.remainingCredits === 'number') {
+          appState.credits = appState.generatedPattern.remainingCredits;
+          updateCreditUI();
+        } else if (!appState.demoMode) {
+          appState.credits = Math.max(0, appState.credits - 1);
+          updateCreditUI();
+        }
+      } catch (error) {
+        if (String(error.message || '').toLowerCase().includes('no credits remaining')) {
+          openPricingModal();
+        } else {
+          alert(`Pattern generation failed: ${error.message}`);
+        }
         appState.generatedPattern = null;
       }
 
@@ -672,6 +769,28 @@
 
       doc.save("PrintYourFit_CustomPattern.pdf");
     });
+
+    async function confirmCheckoutFromURL() {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('checkout') !== 'success') return;
+      const sessionId = params.get('session_id');
+      if (!sessionId || !appState.isLoggedIn) return;
+      try {
+        const result = await postJSON('/api/payments/confirm', { sessionId }, true);
+        if (typeof result.credits === 'number') {
+          appState.credits = result.credits;
+          updateCreditUI();
+          alert('Payment confirmed. Credits added to your account.');
+        }
+      } catch (error) {
+        alert(`Payment verification pending: ${error.message}`);
+      }
+    }
+
+    (async () => {
+      await hydrateSession();
+      await confirmCheckoutFromURL();
+    })();
   </script>
 </body>
 </html>
