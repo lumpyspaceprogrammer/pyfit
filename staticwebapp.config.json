@@ -1,0 +1,25 @@
+{
+  "navigationFallback": {
+    "rewrite": "/index.html",
+    "exclude": [
+      "/assets/*",
+      "/manifest.json",
+      "/service-worker.js",
+      "/*.{css,js,png,gif,svg,ico,webp,jpg,jpeg,woff,woff2}"
+    ]
+  },
+  "routes": [
+    {
+      "route": "/assets/*",
+      "headers": {
+        "cache-control": "public, max-age=31536000, immutable"
+      }
+    },
+    {
+      "route": "/*",
+      "headers": {
+        "cache-control": "no-cache"
+      }
+    }
+  ]
+}
