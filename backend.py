@@ -76,9 +76,13 @@ def _decode_image_data_url(image_data_url: str) -> tuple[str, bytes]:
 
 def _write_generated_file(filename: str, content: bytes) -> str:
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-    path = GENERATED_DIR / filename
+    safe_name = Path(filename).name
+    path = (GENERATED_DIR / safe_name).resolve()
+    generated_root = GENERATED_DIR.resolve()
+    if generated_root not in path.parents:
+        raise ValueError("Invalid generated filename.")
     path.write_bytes(content)
-    return f"/data/generated/{filename}"
+    return f"/data/generated/{safe_name}"
 
 
 def _svg_escape(text: str) -> str:
