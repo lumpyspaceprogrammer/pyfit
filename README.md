@@ -28,6 +28,10 @@ Then open `http://localhost:8000`.
 
 - `POST /api/mesh/refine` updates mesh params from refinement text.
 - `POST /api/pattern/generate` returns generated pattern geometry + sewing instructions and persists it.
+- `POST /api/pipeline/run` runs the backend photo-to-pattern pipeline:
+  - accepts `imageDataUrl` (base64 data URL), `designPrompt`, and `measurements`
+  - writes source upload, mannequin-free SVG render, and tiled multi-page PDF to `/home/runner/work/pyfit/pyfit/data/generated`
+  - returns `mannequinFreeRenderUrl` and `patternPdfUrl` for frontend rendering/download
 - `GET /api/health` returns service status.
 
 ## Payment wiring (Stripe Checkout)

@@ -3,7 +3,9 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
+import re
 import secrets
 import sqlite3
 from dataclasses import dataclass
@@ -17,6 +19,7 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
+GENERATED_DIR = DATA_DIR / "generated"
 DB_PATH = DATA_DIR / "pyfit.db"
 
 TOKEN_TTL_DAYS = 30
@@ -47,6 +50,233 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _safe_slug(value: str, fallback: str = "design") -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (value or "").strip().lower()).strip("-")
+    return slug[:40] or fallback
+
+
+def _decode_image_data_url(image_data_url: str) -> tuple[str, bytes]:
+    if not isinstance(image_data_url, str):
+        raise ValueError("imageDataUrl must be a string.")
+    match = re.match(r"^data:image/(png|jpeg|jpg|webp);base64,(.+)$", image_data_url, re.IGNORECASE)
+    if not match:
+        raise ValueError("imageDataUrl must be a valid base64 data URL (png, jpg, jpeg, webp).")
+    ext = match.group(1).lower()
+    ext = "jpg" if ext == "jpeg" else ext
+    try:
+        raw = base64.b64decode(match.group(2), validate=True)
+    except Exception as exc:
+        raise ValueError("imageDataUrl contains invalid base64 data.") from exc
+    if len(raw) > 10 * 1024 * 1024:
+        raise ValueError("imageDataUrl is too large (max 10MB).")
+    return ext, raw
+
+
+def _write_generated_file(filename: str, content: bytes) -> str:
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    path = GENERATED_DIR / filename
+    path.write_bytes(content)
+    return f"/data/generated/{filename}"
+
+
+def _svg_escape(text: str) -> str:
+    return (
+        (text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def _layout_pattern_pieces_mm(pattern: dict) -> tuple[list[dict], float, float]:
+    pieces = pattern.get("pieces") or []
+    placed = []
+    cursor_x = 0.0
+    max_height = 0.0
+    for piece in pieces:
+        pts_cm = piece.get("points") or []
+        if len(pts_cm) < 2:
+            continue
+        xs = [float(p[0]) for p in pts_cm]
+        ys = [float(p[1]) for p in pts_cm]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        width_mm = max(10.0, (max_x - min_x) * 10.0)
+        height_mm = max(10.0, (max_y - min_y) * 10.0)
+        shifted = [
+            [((float(x) - min_x) * 10.0) + cursor_x + 15.0, ((float(y) - min_y) * 10.0) + 15.0]
+            for x, y in pts_cm
+        ]
+        placed.append(
+            {
+                "name": piece.get("name") or "Pattern Piece",
+                "points_mm": shifted,
+                "bbox": [cursor_x + 15.0, 15.0, cursor_x + 15.0 + width_mm, 15.0 + height_mm],
+            }
+        )
+        cursor_x += width_mm + 30.0
+        max_height = max(max_height, height_mm)
+    total_w = max(40.0, cursor_x + 15.0)
+    total_h = max(40.0, max_height + 30.0)
+    return placed, total_w, total_h
+
+
+def generate_mannequin_free_svg(pattern: dict, design_prompt: str) -> bytes:
+    pieces, total_w, total_h = _layout_pattern_pieces_mm(pattern)
+    width = total_w + 30.0
+    height = total_h + 30.0
+    rows = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width:.2f}mm" height="{height:.2f}mm" viewBox="0 0 {width:.2f} {height:.2f}">',
+        '<rect x="0" y="0" width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="10" y="14" font-family="Arial, sans-serif" font-size="6" fill="#111">Mannequin-free garment layout</text>',
+        f'<text x="10" y="22" font-family="Arial, sans-serif" font-size="4" fill="#444">{_svg_escape(design_prompt[:120])}</text>',
+    ]
+    for piece in pieces:
+        pts = " ".join(f"{x+10:.2f},{y+10:.2f}" for x, y in piece["points_mm"])
+        rows.append(f'<polygon points="{pts}" fill="none" stroke="#d946ef" stroke-width="0.8"/>')
+        label_x = piece["bbox"][0] + 10.0
+        label_y = piece["bbox"][1] + 6.0
+        rows.append(
+            f'<text x="{label_x:.2f}" y="{label_y:.2f}" font-family="Arial, sans-serif" font-size="4" fill="#111">{_svg_escape(piece["name"])}</text>'
+        )
+    rows.append("</svg>")
+    return "\n".join(rows).encode("utf-8")
+
+
+def _pdf_escape(text: str) -> str:
+    return (text or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _mm_to_pt(mm: float) -> float:
+    return mm * 72.0 / 25.4
+
+
+def _build_pdf(pages_commands: list[str], page_w_mm: float = 210.0, page_h_mm: float = 297.0) -> bytes:
+    page_w_pt = _mm_to_pt(page_w_mm)
+    page_h_pt = _mm_to_pt(page_h_mm)
+    object_count = 3 + len(pages_commands) * 2
+    objects = [""] * (object_count + 1)
+
+    objects[1] = "<< /Type /Catalog /Pages 2 0 R >>"
+    page_ids = []
+    for i in range(len(pages_commands)):
+        page_ids.append(5 + i * 2)
+    kids = " ".join(f"{page_id} 0 R" for page_id in page_ids)
+    objects[2] = f"<< /Type /Pages /Kids [{kids}] /Count {len(page_ids)} >>"
+    objects[3] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+
+    for i, commands in enumerate(pages_commands):
+        content_id = 4 + i * 2
+        page_id = 5 + i * 2
+        stream = commands.encode("utf-8")
+        objects[content_id] = f"<< /Length {len(stream)} >>\nstream\n{commands}\nendstream"
+        objects[page_id] = (
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_w_pt:.3f} {page_h_pt:.3f}] "
+            f"/Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >>"
+        )
+
+    buffer = bytearray()
+    buffer.extend(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0] * (object_count + 1)
+    for i in range(1, object_count + 1):
+        offsets[i] = len(buffer)
+        buffer.extend(f"{i} 0 obj\n".encode("utf-8"))
+        buffer.extend(objects[i].encode("utf-8"))
+        buffer.extend(b"\nendobj\n")
+
+    xref_start = len(buffer)
+    buffer.extend(f"xref\n0 {object_count + 1}\n".encode("utf-8"))
+    buffer.extend(b"0000000000 65535 f \n")
+    for i in range(1, object_count + 1):
+        buffer.extend(f"{offsets[i]:010d} 00000 n \n".encode("utf-8"))
+    buffer.extend(
+        (
+            "trailer\n"
+            f"<< /Size {object_count + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_start}\n%%EOF\n"
+        ).encode("utf-8")
+    )
+    return bytes(buffer)
+
+
+def generate_tiled_pattern_pdf(pattern: dict, design_prompt: str, measurements: Measurements) -> bytes:
+    pieces, total_w_mm, total_h_mm = _layout_pattern_pieces_mm(pattern)
+    printable_w_mm = 190.0
+    printable_h_mm = 277.0
+    pages_x = max(1, math.ceil(total_w_mm / printable_w_mm))
+    pages_y = max(1, math.ceil(total_h_mm / printable_h_mm))
+    total_pages = pages_x * pages_y
+    page_w_mm = 210.0
+    page_h_mm = 297.0
+    margin_x_mm = 10.0
+    margin_y_mm = 10.0
+    pages = []
+
+    for py in range(pages_y):
+        for px in range(pages_x):
+            commands = []
+            commands.append("0 0 0 RG 0.6 w")
+            commands.append(
+                f"{_mm_to_pt(margin_x_mm):.3f} {_mm_to_pt(margin_y_mm):.3f} "
+                f"{_mm_to_pt(printable_w_mm):.3f} {_mm_to_pt(printable_h_mm):.3f} re S"
+            )
+            commands.append("0.88 0.88 0.88 RG 0.2 w")
+            for gx in range(0, int(printable_w_mm) + 1, 10):
+                x_pt = _mm_to_pt(margin_x_mm + gx)
+                commands.append(
+                    f"{x_pt:.3f} {_mm_to_pt(margin_y_mm):.3f} m {x_pt:.3f} {_mm_to_pt(margin_y_mm + printable_h_mm):.3f} l S"
+                )
+            for gy in range(0, int(printable_h_mm) + 1, 10):
+                y_pt = _mm_to_pt(margin_y_mm + gy)
+                commands.append(
+                    f"{_mm_to_pt(margin_x_mm):.3f} {y_pt:.3f} m {_mm_to_pt(margin_x_mm + printable_w_mm):.3f} {y_pt:.3f} l S"
+                )
+
+            tile_label = (
+                f"Page {py * pages_x + px + 1}/{total_pages}  Tile {chr(65 + py)}{px + 1}  "
+                f"Prompt: {design_prompt[:40]}"
+            )
+            commands.append("BT /F1 9 Tf 0 0 0 rg")
+            commands.append(f"{_mm_to_pt(12):.3f} {_mm_to_pt(287):.3f} Td ({_pdf_escape(tile_label)}) Tj ET")
+
+            measure_line = (
+                f"B:{measurements.bust:.1f} W:{measurements.waist:.1f} H:{measurements.hip:.1f} "
+                f"Sh:{measurements.shoulder:.1f} N-W:{measurements.napeToWaist:.1f} L:{measurements.length:.1f} cm"
+            )
+            commands.append("BT /F1 8 Tf 0 0 0 rg")
+            commands.append(f"{_mm_to_pt(12):.3f} {_mm_to_pt(281):.3f} Td ({_pdf_escape(measure_line)}) Tj ET")
+            commands.append("1 0.27 0.94 RG 0.9 w")
+
+            tile_x0 = px * printable_w_mm
+            tile_x1 = tile_x0 + printable_w_mm
+            tile_y0 = py * printable_h_mm
+            tile_y1 = tile_y0 + printable_h_mm
+
+            for piece in pieces:
+                bx0, by0, bx1, by1 = piece["bbox"]
+                if bx1 < tile_x0 or bx0 > tile_x1 or by1 < tile_y0 or by0 > tile_y1:
+                    continue
+                pts = piece["points_mm"]
+                if len(pts) < 2:
+                    continue
+                transformed = []
+                for x_mm, y_mm in pts:
+                    local_x = x_mm - tile_x0 + margin_x_mm
+                    local_y = y_mm - tile_y0 + margin_y_mm
+                    pdf_x = _mm_to_pt(local_x)
+                    pdf_y = _mm_to_pt(page_h_mm - local_y)
+                    transformed.append((pdf_x, pdf_y))
+                commands.append(f"{transformed[0][0]:.3f} {transformed[0][1]:.3f} m")
+                for x_pt, y_pt in transformed[1:]:
+                    commands.append(f"{x_pt:.3f} {y_pt:.3f} l")
+                commands.append("h S")
+            pages.append("\n".join(commands))
+
+    return _build_pdf(pages)
 
 
 def _password_hash(password: str, salt_b64: str) -> str:
@@ -140,6 +370,7 @@ def db_conn() -> sqlite3.Connection:
 
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
     with db_conn() as conn:
         conn.executescript(
             """
@@ -168,6 +399,18 @@ def init_db() -> None:
                 measurements_json TEXT NOT NULL,
                 pattern_json TEXT NOT NULL,
                 instructions_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS pipeline_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                design_prompt TEXT NOT NULL,
+                source_image_path TEXT NOT NULL,
+                render_svg_path TEXT NOT NULL,
+                pdf_path TEXT NOT NULL,
+                measurements_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id)
             );
@@ -493,6 +736,78 @@ class Handler(SimpleHTTPRequestHandler):
             if remaining_credits is not None:
                 result["remainingCredits"] = remaining_credits
             self._send_json(result)
+            return
+
+        if parsed.path == "/api/pipeline/run":
+            image_data_url = payload.get("imageDataUrl")
+            design_prompt = (payload.get("designPrompt") or "").strip()
+            if not image_data_url:
+                self._send_json({"error": "imageDataUrl is required."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            if not design_prompt:
+                self._send_json({"error": "designPrompt is required."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                m = payload.get("measurements") or {}
+                measurements = Measurements(
+                    bust=float(m["bust"]),
+                    waist=float(m["waist"]),
+                    hip=float(m["hip"]),
+                    shoulder=float(m["shoulder"]),
+                    napeToWaist=float(m["napeToWaist"]),
+                    length=float(m["length"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                self._send_json({"error": "Invalid measurements payload."}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            try:
+                image_ext, image_bytes = _decode_image_data_url(image_data_url)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            result = generate_pattern(measurements, design_prompt)
+            slug = _safe_slug(design_prompt)
+            asset_token = secrets.token_hex(8)
+            source_image_url = _write_generated_file(f"{slug}-{asset_token}-source.{image_ext}", image_bytes)
+            render_svg = generate_mannequin_free_svg(result["pattern"], design_prompt)
+            render_svg_url = _write_generated_file(f"{slug}-{asset_token}-mannequin-free.svg", render_svg)
+            tiled_pdf = generate_tiled_pattern_pdf(result["pattern"], design_prompt, measurements)
+            pdf_url = _write_generated_file(f"{slug}-{asset_token}-pattern-grid.pdf", tiled_pdf)
+
+            with db_conn() as conn:
+                user = get_user_from_token(conn, parse_bearer_token(self.headers))
+                user_id = user["id"] if user else None
+                conn.execute(
+                    """
+                    INSERT INTO pipeline_assets (
+                        user_id, design_prompt, source_image_path, render_svg_path, pdf_path, measurements_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        design_prompt,
+                        source_image_url,
+                        render_svg_url,
+                        pdf_url,
+                        json.dumps(result["measurements"]),
+                        _utc_now_iso(),
+                    ),
+                )
+                conn.commit()
+
+            self._send_json(
+                {
+                    "designPrompt": result["designPrompt"],
+                    "measurements": result["measurements"],
+                    "pattern": result["pattern"],
+                    "instructions": result["instructions"],
+                    "sourceImageUrl": source_image_url,
+                    "mannequinFreeRenderUrl": render_svg_url,
+                    "patternPdfUrl": pdf_url,
+                }
+            )
             return
 
         if parsed.path == "/api/payments/checkout":
