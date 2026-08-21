@@ -52,11 +52,6 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _safe_slug(value: str, fallback: str = "design") -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", (value or "").strip().lower()).strip("-")
-    return slug[:40] or fallback
-
-
 def _decode_image_data_url(image_data_url: str) -> tuple[str, bytes]:
     if not isinstance(image_data_url, str):
         raise ValueError("imageDataUrl must be a string.")
@@ -74,9 +69,13 @@ def _decode_image_data_url(image_data_url: str) -> tuple[str, bytes]:
     return ext, raw
 
 
-def _write_generated_file(filename: str, content: bytes) -> str:
+def _write_generated_file(kind: str, ext: str, content: bytes) -> str:
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-    safe_name = Path(filename).name
+    allowed_kinds = {"source", "render", "pattern"}
+    allowed_exts = {"png", "jpg", "webp", "svg", "pdf"}
+    if kind not in allowed_kinds or ext not in allowed_exts:
+        raise ValueError("Invalid generated file type.")
+    safe_name = f"{kind}-{secrets.token_hex(16)}.{ext}"
     path = (GENERATED_DIR / safe_name).resolve()
     generated_root = GENERATED_DIR.resolve()
     if generated_root not in path.parents:
@@ -772,13 +771,11 @@ class Handler(SimpleHTTPRequestHandler):
                 return
 
             result = generate_pattern(measurements, design_prompt)
-            slug = _safe_slug(design_prompt)
-            asset_token = secrets.token_hex(8)
-            source_image_url = _write_generated_file(f"{slug}-{asset_token}-source.{image_ext}", image_bytes)
+            source_image_url = _write_generated_file("source", image_ext, image_bytes)
             render_svg = generate_mannequin_free_svg(result["pattern"], design_prompt)
-            render_svg_url = _write_generated_file(f"{slug}-{asset_token}-mannequin-free.svg", render_svg)
+            render_svg_url = _write_generated_file("render", "svg", render_svg)
             tiled_pdf = generate_tiled_pattern_pdf(result["pattern"], design_prompt, measurements)
-            pdf_url = _write_generated_file(f"{slug}-{asset_token}-pattern-grid.pdf", tiled_pdf)
+            pdf_url = _write_generated_file("pattern", "pdf", tiled_pdf)
 
             with db_conn() as conn:
                 user = get_user_from_token(conn, parse_bearer_token(self.headers))
