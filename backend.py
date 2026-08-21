@@ -69,11 +69,11 @@ def _decode_image_data_url(image_data_url: str) -> tuple[str, bytes]:
     return ext, raw
 
 
-def _write_generated_file(kind: str, ext: str, content: bytes) -> str:
+def _write_generated_file(kind: str, content: bytes) -> str:
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-    allowed_kinds = {"source", "render", "pattern"}
-    allowed_exts = {"png", "jpg", "webp", "svg", "pdf"}
-    if kind not in allowed_kinds or ext not in allowed_exts:
+    ext_by_kind = {"source": "bin", "render": "svg", "pattern": "pdf"}
+    ext = ext_by_kind.get(kind)
+    if not ext:
         raise ValueError("Invalid generated file type.")
     safe_name = f"{kind}-{secrets.token_hex(16)}.{ext}"
     path = (GENERATED_DIR / safe_name).resolve()
@@ -765,17 +765,17 @@ class Handler(SimpleHTTPRequestHandler):
                 return
 
             try:
-                image_ext, image_bytes = _decode_image_data_url(image_data_url)
+                _, image_bytes = _decode_image_data_url(image_data_url)
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
 
             result = generate_pattern(measurements, design_prompt)
-            source_image_url = _write_generated_file("source", image_ext, image_bytes)
+            source_image_url = _write_generated_file("source", image_bytes)
             render_svg = generate_mannequin_free_svg(result["pattern"], design_prompt)
-            render_svg_url = _write_generated_file("render", "svg", render_svg)
+            render_svg_url = _write_generated_file("render", render_svg)
             tiled_pdf = generate_tiled_pattern_pdf(result["pattern"], design_prompt, measurements)
-            pdf_url = _write_generated_file("pattern", "pdf", tiled_pdf)
+            pdf_url = _write_generated_file("pattern", tiled_pdf)
 
             with db_conn() as conn:
                 user = get_user_from_token(conn, parse_bearer_token(self.headers))
